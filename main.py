@@ -1,293 +1,344 @@
 import os
-import json
-import requests
-from bs4 import BeautifulSoup
-from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Application
+import logging
 import threading
 import time
 from datetime import datetime
+from flask import Flask, request, jsonify
 from pymongo import MongoClient
-from dotenv import load_dotenv
+from telegram import Update, Bot
+from telegram.ext import Application
+from telegram.error import TelegramError
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import quote
 
-load_dotenv()
+# Логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация Flask
+app = Flask(__name__)
 
 # Переменные окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL", "mongodb+srv://herozvz07_db_user:iXi80aUXy9qUtPcP@cluster0.bb0wzws.mongodb.net/?appName=Cluster0")
-GUILD_URL = "https://www.rucoyonline.com/guild/Imperia%20Of%20Titans"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-render-app.onrender.com")
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+MONGO_URL = 'mongodb+srv://herozvz07_db_user:iXi80aUXy9qUtPcP@cluster0.bb0wzws.mongodb.net/?appName=Cluster0'
+GUILD_URL = 'https://www.rucoyonline.com/guild/Imperia%20Of%20Titans'
+ADMIN_ID = 6395348885
+PORT = int(os.environ.get('PORT', 10000))
+
+if not TELEGRAM_TOKEN:
+    logger.error('TELEGRAM_TOKEN not set!')
+    raise ValueError('TELEGRAM_TOKEN environment variable not found')
 
 # MongoDB подключение
 try:
-    mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+    mongo_client = MongoClient(MONGO_URL)
     mongo_client.admin.command('ping')
-    db = mongo_client['guild_bot_db']
-    print("✅ MongoDB подключена успешно")
+    logger.info('✅ MongoDB connected successfully')
 except Exception as e:
-    print(f"❌ Ошибка подключения к MongoDB: {e}")
-    exit(1)
+    logger.error(f'❌ MongoDB connection failed: {e}')
+    raise
 
-# Collections
+db = mongo_client['guild_bot']
 config_collection = db['config']
 members_collection = db['members']
 
-# Flask приложение
-app = Flask(__name__)
+# Инициализация Telegram Bot
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ==================== ПАРСИНГ ГИЛЬДИИ ====================
+# Глобальные переменные для отслеживания
+last_members = {}
+current_chat_id = None
+current_thread_id = None
 
-def parse_guild_members():
-    """Парсит страницу гильдии и возвращает список членов"""
+
+def get_guild_members():
+    """
+    Парсит страницу гильдии и возвращает список членов
+    """
     try:
-        response = requests.get(GUILD_URL, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(GUILD_URL, headers=headers, timeout=10)
         response.encoding = 'utf-8'
+        
+        if response.status_code != 200:
+            logger.warning(f'Failed to fetch guild page: {response.status_code}')
+            return []
+        
         soup = BeautifulSoup(response.content, 'html.parser')
         
+        # Поиск таблицы с членами
         members = []
         
-        # Ищем таблицу с членами
-        table = soup.find('table')
-        if not table:
-            print("❌ Таблица членов не найдена")
-            return members
+        # Находим все строки таблицы с членами
+        tables = soup.find_all('table')
         
-        rows = table.find_all('tr')[1:]  # Пропускаем заголовок
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) >= 3:
+                    # Извлекаем имя, статус, уровень и дату присоединения
+                    name_col = cols[0].text.strip()
+                    level_col = cols[1].text.strip()
+                    date_col = cols[2].text.strip()
+                    
+                    # Проверяем лидера (содержит "Leader")
+                    is_leader = 'Leader' in name_col or 'Leader' in str(cols[0])
+                    
+                    # Очищаем имя от статуса
+                    name = name_col.replace('(Leader)', '').replace('Supporter', '').replace('online', '').strip()
+                    
+                    if name and level_col.isdigit():
+                        members.append({
+                            'name': name,
+                            'level': int(level_col),
+                            'join_date': date_col,
+                            'is_leader': is_leader,
+                            'status': 'online' if 'online' in name_col.lower() else 'offline'
+                        })
         
-        for row in rows:
-            cols = row.find_all('td')
-            if len(cols) >= 3:
-                name = cols[0].get_text(strip=True)
-                status = cols[1].get_text(strip=True)
-                level = cols[2].get_text(strip=True)
-                
-                # Проверяем онлайн статус
-                is_online = 'online' in status.lower()
-                is_leader = 'leader' in status.lower()
-                
-                member = {
-                    'name': name,
-                    'level': int(level) if level.isdigit() else 0,
-                    'status': status,
-                    'is_online': is_online,
-                    'is_leader': is_leader
-                }
-                members.append(member)
-        
+        logger.info(f'✅ Fetched {len(members)} members from guild')
         return members
+    
     except Exception as e:
-        print(f"❌ Ошибка парсинга: {e}")
+        logger.error(f'❌ Error parsing guild page: {e}')
         return []
 
-# ==================== ФУНКЦИИ БД ====================
 
-def get_last_members():
-    """Получить последний снимок членов из БД"""
-    doc = members_collection.find_one({"_id": "current"})
-    if doc:
-        return doc.get('members', [])
-    return []
-
-def update_members(members):
-    """Обновить снимок членов в БД"""
-    members_collection.update_one(
-        {"_id": "current"},
-        {"$set": {"members": members, "updated_at": datetime.now()}},
-        upsert=True
-    )
-
-def get_config():
-    """Получить конфигурацию бота"""
-    doc = config_collection.find_one({"_id": "main"})
-    return doc if doc else {}
-
-def set_config(chat_id, topic_id=None):
-    """Установить конфигурацию (чат для уведомлений)"""
-    config_collection.update_one(
-        {"_id": "main"},
-        {"$set": {"chat_id": chat_id, "topic_id": topic_id, "updated_at": datetime.now()}},
-        upsert=True
-    )
-
-def get_admin_id():
-    """Получить ID админа (вас)"""
-    return 6395348885
-
-# ==================== ФУНКЦИИ ОТПРАВКИ СООБЩЕНИЙ ====================
-
-async def send_notification(message_text):
-    """Отправить уведомление в установленный чат"""
-    config = get_config()
-    chat_id = config.get('chat_id')
-    topic_id = config.get('topic_id')
-    
-    if not chat_id:
-        print("⚠️ Чат для уведомлений не установлен")
-        return
+def check_guild_changes():
+    """
+    Проверяет изменения в составе гильдии и отправляет уведомления
+    """
+    global last_members, current_chat_id, current_thread_id
     
     try:
-        if topic_id:
-            await bot.send_message(chat_id=chat_id, text=message_text, message_thread_id=topic_id, parse_mode="HTML")
+        # Получаем текущих членов
+        current_members = get_guild_members()
+        
+        if not current_members:
+            logger.warning('No members found on guild page')
+            return
+        
+        # Получаем конфиг из БД
+        config = config_collection.find_one({'_id': 'main'})
+        if not config or not config.get('chat_id'):
+            logger.info('Bot not configured yet')
+            return
+        
+        chat_id = config['chat_id']
+        thread_id = config.get('thread_id', None)
+        
+        # Преобразуем членов в словарь для сравнения
+        current_names = {m['name']: m for m in current_members}
+        
+        # Получаем последних членов из БД
+        members_doc = members_collection.find_one({'_id': 'current'})
+        if members_doc and members_doc.get('members'):
+            last_names = {m['name']: m for m in members_doc['members']}
         else:
-            await bot.send_message(chat_id=chat_id, text=message_text, parse_mode="HTML")
-        print(f"✅ Сообщение отправлено: {message_text[:50]}...")
+            last_names = {}
+        
+        # Проверяем новых членов
+        new_members = [name for name in current_names if name not in last_names]
+        
+        # Проверяем ушедших членов
+        left_members = [name for name in last_names if name not in current_names]
+        
+        # Отправляем уведомления о новых членах
+        for member_name in new_members:
+            member = current_names[member_name]
+            level = member['level']
+            message = f"🎉 **Новый член гильдии!**\n\n👤 {member_name}\n⚔️ Уровень: {level}"
+            
+            try:
+                if thread_id:
+                    bot.send_message(chat_id=chat_id, text=message, message_thread_id=thread_id, parse_mode='Markdown')
+                else:
+                    bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                logger.info(f'✅ Sent welcome message for {member_name}')
+            except TelegramError as e:
+                logger.error(f'Failed to send welcome message: {e}')
+        
+        # Отправляем уведомления об ушедших членах
+        for member_name in left_members:
+            message = f"👋 **Член гильдии покинул нас!**\n\n👤 {member_name}"
+            
+            try:
+                if thread_id:
+                    bot.send_message(chat_id=chat_id, text=message, message_thread_id=thread_id, parse_mode='Markdown')
+                else:
+                    bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                logger.info(f'✅ Sent goodbye message for {member_name}')
+            except TelegramError as e:
+                logger.error(f'Failed to send goodbye message: {e}')
+        
+        # Обновляем членов в БД
+        members_collection.update_one(
+            {'_id': 'current'},
+            {'$set': {'members': current_members, 'updated': datetime.now()}},
+            upsert=True
+        )
+        
+        logger.info(f'✅ Guild check completed. New: {len(new_members)}, Left: {len(left_members)}')
+    
     except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
+        logger.error(f'❌ Error in check_guild_changes: {e}')
 
-async def send_reply(chat_id, message_text, topic_id=None):
-    """Отправить ответ пользователю"""
-    try:
-        if topic_id:
-            await bot.send_message(chat_id=chat_id, text=message_text, message_thread_id=topic_id, parse_mode="HTML")
-        else:
-            await bot.send_message(chat_id=chat_id, text=message_text, parse_mode="HTML")
-    except Exception as e:
-        print(f"❌ Ошибка отправки ответа: {e}")
 
-# ==================== КОМАНДЫ БОТА ====================
-
-async def handle_botguild(chat_id, message_id, topic_id=None):
-    """Установить чат для уведомлений (только для админа)"""
-    user_id = 6395348885  # Вы будете админом
+def background_guild_checker():
+    """
+    Фоновый поток для проверки гильдии каждые 5 минут
+    """
+    logger.info('🔄 Background guild checker started')
     
-    if chat_id != user_id and chat_id > 0:  # Проверка в личке
-        await send_reply(chat_id, "❌ Эта команда доступна только админу гильдии!")
-        return
-    
-    set_config(chat_id, topic_id)
-    await send_reply(chat_id, "✅ <b>Бот настроен!</b>\n\nУведомления о новых/ушедших членах будут отправляться в этот чат.")
-
-async def handle_online(chat_id, topic_id=None):
-    """Показать онлайн членов гильдии"""
-    members = parse_guild_members()
-    online_members = [m for m in members if m['is_online']]
-    
-    if not online_members:
-        msg = "❌ Сейчас никого нет онлайн"
-    else:
-        msg = "<b>🟢 Онлайн члены гильдии:</b>\n\n"
-        for member in online_members:
-            emoji = "👑" if member['is_leader'] else "⚔️"
-            msg += f"{emoji} <b>{member['name']}</b> - Уровень {member['level']}\n"
-    
-    await send_reply(chat_id, msg, topic_id)
-
-async def handle_lvl(chat_id, topic_id=None):
-    """Показать топ-5 по уровню"""
-    members = parse_guild_members()
-    sorted_members = sorted(members, key=lambda x: x['level'], reverse=True)[:5]
-    
-    msg = "<b>🏆 Топ-5 по уровню:</b>\n\n"
-    for i, member in enumerate(sorted_members, 1):
-        emoji = "👑" if member['is_leader'] else "⚔️"
-        msg += f"{i}. {emoji} <b>{member['name']}</b> - Уровень <b>{member['level']}</b>\n"
-    
-    await send_reply(chat_id, msg, topic_id)
-
-# ==================== ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ====================
-
-async def check_guild_changes():
-    """Проверять изменения в гильдии каждые 5 минут"""
     while True:
         try:
+            check_guild_changes()
             time.sleep(300)  # 5 минут
-            
-            current_members = parse_guild_members()
-            last_members = get_last_members()
-            
-            # Сравниваем список
-            current_names = {m['name'] for m in current_members}
-            last_names = {m['name'] for m in last_members}
-            
-            # Новые члены
-            new_members = current_names - last_names
-            for name in new_members:
-                member = next(m for m in current_members if m['name'] == name)
-                msg = f"🎉 <b>Новый член гильдии!</b>\n\n⚔️ {name}\n📊 Уровень: {member['level']}"
-                await send_notification(msg)
-            
-            # Ушедшие члены
-            left_members = last_names - current_names
-            for name in left_members:
-                msg = f"😢 <b>Член гильдии ушел</b>\n\n⚔️ {name}"
-                await send_notification(msg)
-            
-            # Обновляем список
-            update_members(current_members)
-            
         except Exception as e:
-            print(f"❌ Ошибка в check_guild_changes: {e}")
+            logger.error(f'❌ Error in background checker: {e}')
+            time.sleep(300)
 
-# ==================== ВЕБХУК FLASK ====================
 
-@app.route('/', methods=['POST'])
-async def webhook():
-    """Вебхук Telegram"""
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    Обработчик вебхука от Telegram
+    """
     try:
-        data = request.get_json()
-        update = Update.de_json(data, bot)
+        update_data = request.get_json()
+        if not update_data:
+            return jsonify({'ok': False}), 200
         
-        if update.message:
-            chat_id = update.message.chat_id
-            user_id = update.message.from_user.id
-            topic_id = update.message.message_thread_id
-            text = update.message.text or ""
-            
-            # /botguild - установить чат (только админу)
-            if text.startswith('/botguild'):
-                if user_id == get_admin_id():
-                    await handle_botguild(chat_id, update.message.message_id, topic_id)
-                else:
-                    await send_reply(chat_id, "❌ Эта команда только для админа!", topic_id)
-            
-            # /online - список онлайн
-            elif text.startswith('/online'):
-                await handle_online(chat_id, topic_id)
-            
-            # /lvl - топ-5
-            elif text.startswith('/lvl'):
-                await handle_lvl(chat_id, topic_id)
-            
-            # /start
-            elif text.startswith('/start'):
-                msg = "👋 <b>Добро пожаловать!</b>\n\n"
-                msg += "Доступные команды:\n"
-                msg += "📋 /online - онлайн члены\n"
-                msg += "🏆 /lvl - топ-5 по уровню\n"
-                msg += "⚙️ /botguild - установить канал уведомлений (админ)"
-                await send_reply(chat_id, msg, topic_id)
+        update = Update.de_json(update_data, bot)
         
-        return 'OK', 200
+        if not update.message:
+            return jsonify({'ok': True}), 200
+        
+        chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+        text = update.message.text or ''
+        message_thread_id = update.message.message_thread_id
+        
+        logger.info(f'📨 Message from {user_id} in chat {chat_id}: {text}')
+        
+        # Команда /botguild - установка конфига (только для админа)
+        if text == '/botguild':
+            if user_id != ADMIN_ID:
+                bot.send_message(chat_id=chat_id, text='❌ Только администратор может это делать!')
+                return jsonify({'ok': True}), 200
+            
+            # Сохраняем конфиг
+            config_collection.update_one(
+                {'_id': 'main'},
+                {'$set': {
+                    'chat_id': chat_id,
+                    'thread_id': message_thread_id,
+                    'updated': datetime.now()
+                }},
+                upsert=True
+            )
+            
+            thread_info = f"в теме #{message_thread_id}" if message_thread_id else "в чате"
+            bot.send_message(
+                chat_id=chat_id,
+                text=f'✅ Бот настроен! Уведомления будут отправляться {thread_info}\n\n'
+                     f'Команды:\n'
+                     f'/online - показать онлайн-участников\n'
+                     f'/lvl - топ-5 сильнейших членов',
+                message_thread_id=message_thread_id
+            )
+            logger.info(f'✅ Bot configured for chat {chat_id}, thread {message_thread_id}')
+            return jsonify({'ok': True}), 200
+        
+        # Команда /online - показать онлайн
+        elif text == '/online':
+            members = get_guild_members()
+            online_members = [m for m in members if m['status'] == 'online']
+            
+            if not online_members:
+                bot.send_message(chat_id=chat_id, text='😴 Сейчас никого нет онлайн')
+            else:
+                message = '🟢 **Онлайн-участники:**\n\n'
+                for member in online_members:
+                    leader_badge = '👑' if member['is_leader'] else ''
+                    message += f"{leader_badge} {member['name']} - Уровень {member['level']}\n"
+                
+                bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+            
+            return jsonify({'ok': True}), 200
+        
+        # Команда /lvl - топ-5
+        elif text == '/lvl':
+            members = get_guild_members()
+            sorted_members = sorted(members, key=lambda x: x['level'], reverse=True)[:5]
+            
+            message = '🏆 **Топ-5 сильнейших членов гильдии:**\n\n'
+            for i, member in enumerate(sorted_members, 1):
+                leader_badge = '👑' if member['is_leader'] else ''
+                message += f"{i}. {leader_badge} {member['name']} - Уровень {member['level']}\n"
+            
+            bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+            return jsonify({'ok': True}), 200
+        
+        # Команда /start
+        elif text == '/start':
+            bot.send_message(
+                chat_id=chat_id,
+                text='👋 Привет! Я бот для гильдии **Imperia Of Titans**\n\n'
+                     '📋 Команды:\n'
+                     '/online - показать онлайн-участников\n'
+                     '/lvl - топ-5 сильнейших членов\n'
+                     '/botguild - настроить оповещения (только админ)',
+                parse_mode='Markdown'
+            )
+            return jsonify({'ok': True}), 200
+        
+        return jsonify({'ok': True}), 200
+    
     except Exception as e:
-        print(f"❌ Ошибка вебхука: {e}")
-        return 'ERROR', 500
+        logger.error(f'❌ Error in webhook: {e}')
+        return jsonify({'ok': False}), 500
+
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check для Render"""
-    return 'OK', 200
+    """Проверка здоровья приложения"""
+    try:
+        # Проверяем MongoDB
+        mongo_client.admin.command('ping')
+        return jsonify({'status': 'ok', 'mongo': 'connected'}), 200
+    except Exception as e:
+        logger.error(f'Health check failed: {e}')
+        return jsonify({'status': 'error', 'mongo': 'disconnected'}), 500
 
-# ==================== ЗАПУСК ====================
 
-def run_background_task():
-    """Запустить фоновую проверку в отдельном потоке"""
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(check_guild_changes())
+@app.route('/', methods=['GET'])
+def index():
+    """Главная страница"""
+    return jsonify({
+        'bot': 'Imperia Of Titans Guild Bot',
+        'version': '1.0.0',
+        'status': 'running',
+        'webhook': '/webhook',
+        'health': '/health'
+    }), 200
+
 
 if __name__ == '__main__':
-    # Инициализируем начальный список членов
-    members = parse_guild_members()
-    update_members(members)
-    print(f"✅ Загружено {len(members)} членов гильдии")
+    logger.info('🚀 Starting Guild Bot...')
     
-    # Запускаем фоновую проверку
-    bg_thread = threading.Thread(target=run_background_task, daemon=True)
-    bg_thread.start()
+    # Запускаем фоновый поток для проверки гильдии
+    background_thread = threading.Thread(target=background_guild_checker, daemon=True)
+    background_thread.start()
+    logger.info('✅ Background checker thread started')
     
-    # Запускаем Flask
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Запускаем Flask приложение
+    logger.info(f'🌐 Running Flask app on 0.0.0.0:{PORT}')
+    app.run(host='0.0.0.0', port=PORT, debug=False)
