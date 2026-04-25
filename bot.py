@@ -1,9 +1,3 @@
-"""
-Imperia Of Titans — Guild Bot
-Flask + python-telegram-bot (webhook mode) + APScheduler
-Designed to run on Render.com free tier via gunicorn.
-"""
-
 import os
 import logging
 import asyncio
