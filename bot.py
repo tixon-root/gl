@@ -1,6 +1,3 @@
-"""
-Imperia Of Titans — Guild Bot
-"""
 import os, logging, asyncio, threading
 from datetime import datetime
 
